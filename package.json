@@ -1,0 +1,15 @@
+{
+  "name": "maastrends-backend",
+  "version": "1.0.0",
+  "description": "Backend API server for Maas Trends",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.19.2",
+    "mongoose": "^8.3.1"
+  }
+}
