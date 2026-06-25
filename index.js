@@ -544,3 +544,4 @@ console.log('MongoDB connection completed');
 console.log('ABOUT TO CALL STARTSERVER');
 startServer();
 console.log('STARTSERVER CALLED - SCRIPT REACHED END');
+require('./seedAdmin.js');
