@@ -25,6 +25,57 @@ app.get('/api/test', (req, res) => {
   });
 });
 
+// =========================
+// ⚠️ TEMPORARY ONE-TIME SETUP ROUTE — DELETE AFTER USE
+// =========================
+// Visit this URL once in your browser to create your real admin account.
+// Protected by a secret key so randoms can't trigger it.
+// DELETE THIS ENTIRE ROUTE (and redeploy) right after you've used it once.
+app.get('/api/setup-admin/:secretKey', async (req, res) => {
+  try {
+    const SETUP_SECRET = 'maastrends-setup-2026-change-me'; // change this to anything random
+
+    if (req.params.secretKey !== SETUP_SECRET) {
+      return res.status(403).json({ error: 'Wrong key.' });
+    }
+
+    // ─── EDIT THESE FOUR VALUES TO YOUR REAL INFO ───
+    const ADMIN_NAME = 'Admin';
+    const ADMIN_EMAIL = 'admin@maastrends.com';
+    const ADMIN_PASSWORD = '54321';
+    const ADMIN_PHONE = '9500820522';
+    // ──────────────────────────────────────────────────
+
+    const existing = await User.findOne({ email: ADMIN_EMAIL });
+
+    if (existing) {
+      if (existing.role === 'admin') {
+        return res.json({ message: `Admin "${ADMIN_EMAIL}" already exists. Nothing to do.` });
+      }
+      existing.role = 'admin';
+      await existing.save();
+      return res.json({ message: `Existing user "${ADMIN_EMAIL}" was promoted to admin.` });
+    }
+
+    const hashedPassword = await bcrypt.hash(ADMIN_PASSWORD, 10);
+
+    const admin = await User.create({
+      name: ADMIN_NAME,
+      email: ADMIN_EMAIL,
+      password: hashedPassword,
+      role: 'admin',
+      phone: ADMIN_PHONE,
+    });
+
+    res.json({
+      message: 'Admin user created successfully! You can now log in. Please delete this route now.',
+      email: admin.email,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 
 // =========================
 // AUTH ROUTES
@@ -544,4 +595,3 @@ console.log('MongoDB connection completed');
 console.log('ABOUT TO CALL STARTSERVER');
 startServer();
 console.log('STARTSERVER CALLED - SCRIPT REACHED END');
-require('./seedAdmin.js');
