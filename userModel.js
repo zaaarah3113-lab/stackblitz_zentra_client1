@@ -19,10 +19,41 @@ const userSchema = new mongoose.Schema(
       required: [true, 'Password is required'],
     },
 
+    phone: {
+      type: String,
+      unique: true,
+      sparse: true, // allows multiple users with no phone set, while still enforcing uniqueness when present
+    },
+
+    resetOtpHash: {
+      type: String,
+      default: null,
+    },
+
+    resetOtpExpires: {
+      type: Date,
+      default: null,
+    },
+
     role: {
       type: String,
       enum: ['customer', 'admin'],
       default: 'customer',
+    },
+
+    phone: {
+      type: String,
+      default: null,
+    },
+
+    resetOtp: {
+      type: String,
+      default: null,
+    },
+
+    resetOtpExpires: {
+      type: Date,
+      default: null,
     },
   },
   { timestamps: true }
