@@ -33,6 +33,8 @@ const DEV_ORIGINS = [
   'http://127.0.0.1:5500',
   'http://127.0.0.1:3000',
   'http://127.0.0.1:5173',
+  'http://127.0.0.1:8080',
+  'http://localhost:8080',
 ];
 const allowedOrigins = [
   ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : []),
@@ -58,6 +60,16 @@ app.use(cors({
 }));
 app.use(express.json());
 app.use(cookieParser());
+app.options('*', cors({
+  origin: function (origin, callback) {
+    if (!origin || origin === 'null' || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS blocked for origin: ${origin}`));
+    }
+  },
+  credentials: true,
+}));
 
 // Base Testing Route
 app.get('/api/test', (req, res) => {
