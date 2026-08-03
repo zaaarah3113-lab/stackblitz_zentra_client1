@@ -50,6 +50,16 @@ app.use(cors({
 app.use('/api/razorpay/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(cookieParser());
+app.options('*', cors({
+  origin: function (origin, callback) {
+    if (!origin || origin === 'null' || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS blocked for origin: ${origin}`));
+    }
+  },
+  credentials: true,
+}));
 
 function getRazorpayAuthHeader() {
   if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
