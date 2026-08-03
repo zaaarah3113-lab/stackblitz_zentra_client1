@@ -13,19 +13,14 @@ const Product = require('./productModel');
 const User = require('./userModel');
 const Order = require('./orderModel');
 const Cart = require('./cartModel');
+const DeliveryCharge = require('./deliveryChargeModel');
+const { getSetting, setSetting } = require('./settingsModel');
 const { getNextSequence } = require('./counterModel');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 // ── CORS configuration ──
-// FRONTEND_URL should be set in the environment to your deployed storefront's
-// exact origin (e.g. "https://yourname.github.io") once it's hosted. Until
-// then, common localhost dev-server ports are allowed automatically so
-// `npx http-server`, VS Code "Live Server", Vite, etc. all work without any
-// .env changes. Cookies (used for the guest cart) require an exact origin
-// match — a wildcard "*" origin cannot be combined with credentials, which
-// is why this is an explicit allow-list rather than `origin: true`.
 const DEV_ORIGINS = [
   'http://localhost:3000',
   'http://localhost:5173',
@@ -33,6 +28,8 @@ const DEV_ORIGINS = [
   'http://127.0.0.1:5500',
   'http://127.0.0.1:3000',
   'http://127.0.0.1:5173',
+  'http://127.0.0.1:8080',
+  'http://localhost:8080',
 ];
 const allowedOrigins = [
   ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : []),
@@ -41,13 +38,6 @@ const allowedOrigins = [
 
 app.use(cors({
   origin: function (origin, callback) {
-    // `origin` is undefined for same-origin requests, server-to-server
-    // calls, and curl/Postman — allow those through.
-    // It is the literal string "null" for pages opened via file:// — see
-    // the note below; we allow it too so local file-based testing doesn't
-    // hard-fail, even though cookies won't actually persist in that case
-    // (a browser-level restriction on file:// origins, not something this
-    // server can control).
     if (!origin || origin === 'null' || allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
@@ -56,8 +46,52 @@ app.use(cors({
   },
   credentials: true,
 }));
+// Razorpay webhook signature verification requires the raw request body.
+app.use('/api/razorpay/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(cookieParser());
+
+function getRazorpayAuthHeader() {
+  if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+    return null;
+  }
+  const token = Buffer.from(
+    `${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`
+  ).toString('base64');
+  return `Basic ${token}`;
+}
+
+async function createRazorpayOrder(payload) {
+  const authHeader = getRazorpayAuthHeader();
+  if (!authHeader) {
+    throw new Error('Razorpay is not configured on the server.');
+  }
+
+  const response = await fetch('https://api.razorpay.com/v1/orders', {
+    method: 'POST',
+    headers: {
+      Authorization: authHeader,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error?.description || data.error || 'Failed to create Razorpay order.');
+  }
+  return data;
+}
+app.options('*', cors({
+  origin: function (origin, callback) {
+    if (!origin || origin === 'null' || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS blocked for origin: ${origin}`));
+    }
+  },
+  credentials: true,
+}));
 
 // Base Testing Route
 app.get('/api/test', (req, res) => {
@@ -503,6 +537,82 @@ const ensureGuestSession = (req, res, next) => {
 };
 
 // =========================
+// DELIVERY CHARGE HELPERS
+// =========================
+
+async function resolveDeliveryCharge(pincode) {
+  const normalized = String(pincode || '').trim();
+  if (!normalized) {
+    throw new Error('Pincode is required.');
+  }
+
+  const entry = await DeliveryCharge.findOne({ pincode: normalized });
+  if (entry) {
+    return {
+      pincode: normalized,
+      areaName: entry.areaName || '',
+      deliveryCharge: entry.deliveryCharge,
+      isDefault: false,
+    };
+  }
+
+  const defaultCharge = await getSetting('default_delivery_charge', 0);
+  return {
+    pincode: normalized,
+    areaName: '',
+    deliveryCharge: Number(defaultCharge) || 0,
+    isDefault: true,
+  };
+}
+
+async function buildOrderItemsFromCart(cart, session) {
+  const orderItems = [];
+  let subtotal = 0;
+
+  for (const cartItem of cart.items) {
+    const product = await Product.findById(cartItem.product).session(session);
+    if (!product) {
+      throw new Error('One of the items in your cart is no longer available.');
+    }
+    if (product.stock < cartItem.quantity) {
+      throw new Error(`Not enough stock for "${product.name}". Only ${product.stock} left.`);
+    }
+
+    const lineSubtotal = product.price * cartItem.quantity;
+    subtotal += lineSubtotal;
+
+    orderItems.push({
+      product: product._id,
+      name: product.name,
+      image: product.image,
+      price: product.price,
+      quantity: cartItem.quantity,
+      subtotal: lineSubtotal,
+    });
+  }
+
+  return { orderItems, subtotal };
+}
+
+async function decrementStockForOrderItems(orderItems, session) {
+  for (const item of orderItems) {
+    const product = await Product.findById(item.product).session(session);
+    if (!product) {
+      throw new Error('One of the items in your order is no longer available.');
+    }
+    if (product.stock < item.quantity) {
+      throw new Error(`Not enough stock for "${product.name}". Only ${product.stock} left.`);
+    }
+    product.stock -= item.quantity;
+    await product.save({ session });
+  }
+}
+
+function calculateGrandTotal(subtotal, shippingFee, discount = 0, tax = 0) {
+  return subtotal - discount + shippingFee + tax;
+}
+
+// =========================
 // PRODUCT ROUTES
 // =========================
 
@@ -554,35 +664,42 @@ app.post(
   }
 });
 
-// UPDATE an existing product
+// ----- FIXED: UPDATE product with explicit field mapping and logging -----
 app.put(
   '/api/products/:id',
   authenticateToken,
   adminOnly,
   async (req, res) => {
-  try {
-    const product = await Product.findByIdAndUpdate(
-      req.params.id,
-      req.body,
-      {
-        new: true,
-        runValidators: true,
+    try {
+      console.log('📦 Updating product with body:', req.body);
+
+      const product = await Product.findById(req.params.id);
+      if (!product) {
+        return res.status(404).json({ error: 'Product not found' });
       }
-    );
 
-    if (!product) {
-      return res.status(404).json({
-        error: 'Product not found',
-      });
+      // Explicitly map every field from request body (or keep existing)
+      product.name = req.body.name !== undefined ? req.body.name : product.name;
+      product.category = req.body.category !== undefined ? req.body.category : product.category;
+      product.price = req.body.price !== undefined ? req.body.price : product.price;
+      product.mrp = req.body.mrp !== undefined ? req.body.mrp : product.mrp;
+      product.stock = req.body.stock !== undefined ? req.body.stock : product.stock;
+      product.stockStatus = req.body.stockStatus !== undefined ? req.body.stockStatus : product.stockStatus;
+      product.description = req.body.description !== undefined ? req.body.description : product.description;
+      product.image = req.body.image !== undefined ? req.body.image : product.image;
+      product.fabric = req.body.fabric !== undefined ? req.body.fabric : product.fabric;
+      product.care = req.body.care !== undefined ? req.body.care : product.care;
+
+      await product.save();
+
+      console.log('✅ Updated product:', product);
+      res.json(product);
+    } catch (err) {
+      console.error('Update error:', err);
+      res.status(400).json({ error: err.message });
     }
-
-    res.json(product);
-  } catch (err) {
-    res.status(400).json({
-      error: err.message,
-    });
   }
-});
+);
 
 // DELETE a product
 app.delete(
@@ -608,6 +725,115 @@ app.delete(
     res.status(500).json({
       error: err.message,
     });
+  }
+});
+
+// =========================
+// DELIVERY CHARGE ROUTES
+// =========================
+
+// Public lookup — used by customer checkout when pincode is entered
+app.get('/api/delivery-charge', async (req, res) => {
+  try {
+    const { pincode } = req.query;
+    const result = await resolveDeliveryCharge(pincode);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Admin: list all delivery charge entries (optional pincode search)
+app.get('/api/admin/delivery-charges', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const { search } = req.query;
+    const filter = search
+      ? { pincode: { $regex: String(search).trim(), $options: 'i' } }
+      : {};
+    const entries = await DeliveryCharge.find(filter).sort({ pincode: 1 });
+    res.json(entries);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: get configurable default delivery charge
+app.get('/api/admin/settings/default-delivery-charge', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const value = await getSetting('default_delivery_charge', 0);
+    res.json({ defaultDeliveryCharge: Number(value) || 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: update default delivery charge
+app.put('/api/admin/settings/default-delivery-charge', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const { defaultDeliveryCharge } = req.body;
+    const charge = Number(defaultDeliveryCharge);
+    if (Number.isNaN(charge) || charge < 0) {
+      return res.status(400).json({ error: 'defaultDeliveryCharge must be a number of 0 or more.' });
+    }
+    await setSetting('default_delivery_charge', charge);
+    res.json({ defaultDeliveryCharge: charge });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Admin: create delivery charge entry
+app.post('/api/admin/delivery-charges', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const { pincode, areaName, deliveryCharge } = req.body;
+    if (!pincode || deliveryCharge === undefined || deliveryCharge === null) {
+      return res.status(400).json({ error: 'pincode and deliveryCharge are required.' });
+    }
+    const entry = await DeliveryCharge.create({
+      pincode: String(pincode).trim(),
+      areaName: areaName || '',
+      deliveryCharge: Number(deliveryCharge),
+    });
+    res.status(201).json(entry);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Admin: update delivery charge entry
+app.put('/api/admin/delivery-charges/:id', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const { pincode, areaName, deliveryCharge } = req.body;
+    const update = {};
+    if (pincode !== undefined) update.pincode = String(pincode).trim();
+    if (areaName !== undefined) update.areaName = areaName;
+    if (deliveryCharge !== undefined) update.deliveryCharge = Number(deliveryCharge);
+
+    const entry = await DeliveryCharge.findByIdAndUpdate(req.params.id, update, {
+      new: true,
+      runValidators: true,
+    });
+
+    if (!entry) {
+      return res.status(404).json({ error: 'Delivery charge entry not found.' });
+    }
+
+    res.json(entry);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Admin: delete delivery charge entry
+app.delete('/api/admin/delivery-charges/:id', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const entry = await DeliveryCharge.findByIdAndDelete(req.params.id);
+    if (!entry) {
+      return res.status(404).json({ error: 'Delivery charge entry not found.' });
+    }
+    res.json({ message: 'Delivery charge entry deleted successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -795,11 +1021,88 @@ app.delete('/api/cart', ensureGuestSession, async (req, res) => {
 // database, never trusted from the request body. This is what prevents a
 // shopper from posting a fake price/quantity directly to /api/orders.
 
-// CREATE an order from the current cart (public — guest checkout)
+// CREATE an order from the current cart (public — guest checkout, COD)
 app.post('/api/orders/checkout', ensureGuestSession, optionalAuth, async (req, res) => {
   const session = await mongoose.startSession();
   try {
     const { shipping, paymentMethod, notes } = req.body;
+
+    if (!shipping || !shipping.fullName || !shipping.phone || !shipping.addressLine1 ||
+        !shipping.city || !shipping.state || !shipping.pincode) {
+      return res.status(400).json({ error: 'Missing required shipping details.' });
+    }
+
+    if (paymentMethod === 'razorpay') {
+      return res.status(400).json({
+        error: 'Online payments must use /api/orders/razorpay/create.',
+      });
+    }
+
+    const cart = await Cart.findOne({ guestId: req.guestId });
+    if (!cart || cart.items.length === 0) {
+      return res.status(400).json({ error: 'Your cart is empty.' });
+    }
+
+    const delivery = await resolveDeliveryCharge(shipping.pincode);
+    let orderItems = [];
+    let subtotal = 0;
+
+    await session.withTransaction(async () => {
+      const built = await buildOrderItemsFromCart(cart, session);
+      orderItems = built.orderItems;
+      subtotal = built.subtotal;
+      await decrementStockForOrderItems(orderItems, session);
+    });
+
+    const shippingFee = delivery.deliveryCharge;
+    const discount = 0;
+    const tax = 0;
+    const grandTotal = calculateGrandTotal(subtotal, shippingFee, discount, tax);
+
+    const customerKey = shipping.email
+      ? shipping.email.trim().toLowerCase()
+      : shipping.phone.trim();
+
+    const sequence = await getNextSequence('orderNumber');
+    const orderNumber = `MT${sequence}`;
+
+    const order = await Order.create({
+      orderNumber,
+      user: req.user ? req.user.id : null,
+      guestId: req.guestId,
+      customerKey,
+      items: orderItems,
+      shipping,
+      subtotal,
+      shippingFee,
+      discount,
+      tax,
+      grandTotal,
+      paymentMethod: 'cod',
+      paymentStatus: 'pending',
+      orderStatus: 'order_placed',
+      notes: notes || '',
+    });
+
+    cart.items = [];
+    await cart.save();
+
+    res.status(201).json(order);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  } finally {
+    session.endSession();
+  }
+});
+
+// CREATE a Razorpay order from the current cart (server-calculated total)
+app.post('/api/orders/razorpay/create', ensureGuestSession, optionalAuth, async (req, res) => {
+  try {
+    if (!getRazorpayAuthHeader()) {
+      return res.status(503).json({ error: 'Razorpay is not configured on the server.' });
+    }
+
+    const { shipping, notes } = req.body;
 
     if (!shipping || !shipping.fullName || !shipping.phone || !shipping.addressLine1 ||
         !shipping.city || !shipping.state || !shipping.pincode) {
@@ -811,51 +1114,14 @@ app.post('/api/orders/checkout', ensureGuestSession, optionalAuth, async (req, r
       return res.status(400).json({ error: 'Your cart is empty.' });
     }
 
-    let orderItems = [];
-    let subtotal = 0;
+    const delivery = await resolveDeliveryCharge(shipping.pincode);
+    const { orderItems, subtotal } = await buildOrderItemsFromCart(cart, null);
 
-    await session.withTransaction(async () => {
-      // Re-fetch each product fresh from the DB inside the transaction —
-      // never trust the cart's cached idea of price/stock, since it could
-      // be stale by the time checkout happens.
-      for (const cartItem of cart.items) {
-        const product = await Product.findById(cartItem.product).session(session);
-        if (!product) {
-          throw new Error('One of the items in your cart is no longer available.');
-        }
-        if (product.stock < cartItem.quantity) {
-          throw new Error(`Not enough stock for "${product.name}". Only ${product.stock} left.`);
-        }
-
-        // Decrement stock now, inside the same transaction, so two
-        // simultaneous checkouts can't both succeed by overselling the
-        // same item.
-        product.stock -= cartItem.quantity;
-        await product.save({ session });
-
-        const lineSubtotal = product.price * cartItem.quantity;
-        subtotal += lineSubtotal;
-
-        orderItems.push({
-          product: product._id,
-          name: product.name,
-          image: product.image,
-          price: product.price,
-          quantity: cartItem.quantity,
-          subtotal: lineSubtotal,
-        });
-      }
-    });
-
-    // ── Pricing breakdown ──
-    // Shipping and tax are ₹0 for now, but stored explicitly (not omitted)
-    // so they can be wired up later without changing the schema.
-    const shippingFee = 0;
+    const shippingFee = delivery.deliveryCharge;
     const discount = 0;
     const tax = 0;
-    const grandTotal = subtotal - discount + shippingFee + tax;
+    const grandTotal = calculateGrandTotal(subtotal, shippingFee, discount, tax);
 
-    // Customer identity: email (lowercased) if provided, otherwise phone.
     const customerKey = shipping.email
       ? shipping.email.trim().toLowerCase()
       : shipping.phone.trim();
@@ -866,6 +1132,7 @@ app.post('/api/orders/checkout', ensureGuestSession, optionalAuth, async (req, r
     const order = await Order.create({
       orderNumber,
       user: req.user ? req.user.id : null,
+      guestId: req.guestId,
       customerKey,
       items: orderItems,
       shipping,
@@ -874,21 +1141,146 @@ app.post('/api/orders/checkout', ensureGuestSession, optionalAuth, async (req, r
       discount,
       tax,
       grandTotal,
-      paymentMethod: paymentMethod === 'razorpay' ? 'razorpay' : 'cod',
+      paymentMethod: 'razorpay',
       paymentStatus: 'pending',
-      orderStatus: 'processing',
+      orderStatus: 'awaiting_payment',
       notes: notes || '',
     });
 
-    // Checkout succeeded — empty the cart so it doesn't get re-submitted.
-    cart.items = [];
-    await cart.save();
+    const razorpayOrder = await createRazorpayOrder({
+      amount: Math.round(grandTotal * 100),
+      currency: 'INR',
+      receipt: orderNumber,
+      notes: {
+        orderId: String(order._id),
+        orderNumber,
+      },
+    });
 
-    res.status(201).json(order);
+    order.razorpayOrderId = razorpayOrder.id;
+    await order.save();
+
+    res.status(201).json({
+      orderId: order._id,
+      orderNumber: order.orderNumber,
+      razorpayOrderId: razorpayOrder.id,
+      amount: grandTotal,
+      amountPaise: razorpayOrder.amount,
+      currency: razorpayOrder.currency,
+      keyId: process.env.RAZORPAY_KEY_ID,
+      subtotal,
+      shippingFee,
+      grandTotal,
+    });
   } catch (err) {
     res.status(400).json({ error: err.message });
-  } finally {
-    session.endSession();
+  }
+});
+
+// Poll payment status after Razorpay checkout (webhook is source of truth)
+app.get('/api/orders/:id/payment-status', async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id).select(
+      'orderNumber paymentStatus orderStatus grandTotal subtotal shippingFee items shipping razorpayPaymentId paymentMethod'
+    );
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+
+    res.json({
+      orderId: order._id,
+      orderNumber: order.orderNumber,
+      paymentStatus: order.paymentStatus,
+      orderStatus: order.orderStatus,
+      grandTotal: order.grandTotal,
+      subtotal: order.subtotal,
+      shippingFee: order.shippingFee,
+      items: order.items,
+      shipping: order.shipping,
+      paymentMethod: order.paymentMethod,
+      paid: order.paymentStatus === 'paid',
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Razorpay webhook — verifies signature and marks order as paid
+app.post('/api/razorpay/webhook', async (req, res) => {
+  try {
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      return res.status(503).json({ error: 'Webhook secret is not configured.' });
+    }
+
+    const signature = req.headers['x-razorpay-signature'];
+    const rawBody = req.body;
+    const expectedSignature = crypto
+      .createHmac('sha256', webhookSecret)
+      .update(rawBody)
+      .digest('hex');
+
+    if (signature !== expectedSignature) {
+      return res.status(400).json({ error: 'Invalid webhook signature.' });
+    }
+
+    const event = JSON.parse(rawBody.toString('utf8'));
+    const eventType = event.event;
+
+    if (eventType === 'payment.captured') {
+      const payment = event.payload.payment.entity;
+      const razorpayOrderId = payment.order_id;
+
+      const order = await Order.findOne({ razorpayOrderId });
+      if (!order) {
+        return res.status(404).json({ error: 'Order not found for Razorpay order.' });
+      }
+
+      if (order.paymentStatus === 'paid') {
+        return res.json({ status: 'already_processed' });
+      }
+
+      const session = await mongoose.startSession();
+      try {
+        await session.withTransaction(async () => {
+          await decrementStockForOrderItems(order.items, session);
+
+          order.paymentStatus = 'paid';
+          order.orderStatus = 'order_placed';
+          order.razorpayPaymentId = payment.id;
+          order.razorpaySignature = signature;
+          await order.save({ session });
+
+          if (order.guestId) {
+            await Cart.findOneAndUpdate(
+              { guestId: order.guestId },
+              { items: [] },
+              { session }
+            );
+          }
+        });
+      } finally {
+        session.endSession();
+      }
+
+      return res.json({ status: 'paid' });
+    }
+
+    if (eventType === 'payment.failed') {
+      const payment = event.payload.payment.entity;
+      const order = await Order.findOne({ razorpayOrderId: payment.order_id });
+      if (order && order.paymentStatus !== 'paid') {
+        order.paymentStatus = 'failed';
+        order.orderStatus = 'cancelled';
+        await order.save();
+      }
+      return res.json({ status: 'failed_recorded' });
+    }
+
+    res.json({ status: 'ignored' });
+  } catch (err) {
+    console.error('Razorpay webhook error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -922,7 +1314,7 @@ app.put('/api/orders/:id/status', authenticateToken, adminOnly, async (req, res)
     const update = {};
 
     if (orderStatus) {
-      const validStatuses = ['processing', 'shipped', 'delivered', 'cancelled'];
+      const validStatuses = ['awaiting_payment', 'order_placed', 'processing', 'shipped', 'delivered', 'cancelled'];
       if (!validStatuses.includes(orderStatus)) {
         return res.status(400).json({ error: `orderStatus must be one of: ${validStatuses.join(', ')}` });
       }

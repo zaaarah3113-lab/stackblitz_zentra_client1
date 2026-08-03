@@ -1,9 +1,5 @@
 const mongoose = require('mongoose');
 
-// One line item within an order. We SNAPSHOT the product's name/price/image
-// at the moment of purchase — never reference live Product data for these,
-// because if the admin edits or deletes a product later, past orders must
-// still show exactly what the customer actually bought and paid for.
 const orderItemSchema = new mongoose.Schema({
   product: {
     type: mongoose.Schema.Types.ObjectId,
@@ -19,7 +15,6 @@ const orderItemSchema = new mongoose.Schema({
     default: '',
   },
   price: {
-    // Unit price at time of purchase (snapshot, in rupees)
     type: Number,
     required: true,
     min: 0,
@@ -30,16 +25,12 @@ const orderItemSchema = new mongoose.Schema({
     min: 1,
   },
   subtotal: {
-    // price * quantity, stored explicitly so totals never depend on
-    // re-computing from possibly-changed data later.
     type: Number,
     required: true,
     min: 0,
   },
 }, { _id: false });
 
-// Shipping / contact details. The storefront has no customer login, so this
-// is the ONLY record of who placed the order — captured directly at checkout.
 const shippingInfoSchema = new mongoose.Schema({
   fullName: {
     type: String,
@@ -85,12 +76,25 @@ const shippingInfoSchema = new mongoose.Schema({
 }, { _id: false });
 
 const orderSchema = new mongoose.Schema({
-  // Optional — only set if a logged-in admin/user account placed the order.
-  // Will be null/undefined for the vast majority of real orders, since
-  // customers check out as guests by design.
+  orderNumber: {
+    type: String,
+    unique: true,
+    sparse: true,
+  },
+
   user: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
+    default: null,
+  },
+
+  customerKey: {
+    type: String,
+    default: '',
+  },
+
+  guestId: {
+    type: String,
     default: null,
   },
 
@@ -108,8 +112,7 @@ const orderSchema = new mongoose.Schema({
     required: true,
   },
 
-  itemsTotal: {
-    // Sum of all item subtotals, before shipping/tax adjustments.
+  subtotal: {
     type: Number,
     required: true,
     min: 0,
@@ -121,10 +124,32 @@ const orderSchema = new mongoose.Schema({
     min: 0,
   },
 
-  totalAmount: {
-    // itemsTotal + shippingFee. The authoritative amount the customer owes.
+  discount: {
+    type: Number,
+    default: 0,
+    min: 0,
+  },
+
+  tax: {
+    type: Number,
+    default: 0,
+    min: 0,
+  },
+
+  grandTotal: {
     type: Number,
     required: true,
+    min: 0,
+  },
+
+  // Legacy alias kept for older admin UI references
+  itemsTotal: {
+    type: Number,
+    min: 0,
+  },
+
+  totalAmount: {
+    type: Number,
     min: 0,
   },
 
@@ -140,8 +165,6 @@ const orderSchema = new mongoose.Schema({
     default: 'pending',
   },
 
-  // Razorpay fields — left empty until that integration is added.
-  // Kept here now so adding Razorpay later doesn't require a schema migration.
   razorpayOrderId: {
     type: String,
     default: null,
@@ -157,8 +180,8 @@ const orderSchema = new mongoose.Schema({
 
   orderStatus: {
     type: String,
-    enum: ['processing', 'shipped', 'delivered', 'cancelled'],
-    default: 'processing',
+    enum: ['awaiting_payment', 'order_placed', 'processing', 'shipped', 'delivered', 'cancelled'],
+    default: 'order_placed',
   },
 
   notes: {
@@ -167,9 +190,15 @@ const orderSchema = new mongoose.Schema({
   },
 }, { timestamps: true });
 
-// Useful for admin dashboard lookups (recent orders, status filtering).
+orderSchema.pre('save', function syncLegacyTotals(next) {
+  this.itemsTotal = this.subtotal;
+  this.totalAmount = this.grandTotal;
+  next();
+});
+
 orderSchema.index({ createdAt: -1 });
 orderSchema.index({ 'shipping.phone': 1 });
 orderSchema.index({ orderStatus: 1 });
+orderSchema.index({ razorpayOrderId: 1 });
 
 module.exports = mongoose.model('Order', orderSchema);
