@@ -92,16 +92,6 @@ async function createRazorpayOrder(payload) {
   }
   return data;
 }
-app.options('*', cors({
-  origin: function (origin, callback) {
-    if (!origin || origin === 'null' || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error(`CORS blocked for origin: ${origin}`));
-    }
-  },
-  credentials: true,
-}));
 
 // Base Testing Route
 app.get('/api/test', (req, res) => {
@@ -209,121 +199,6 @@ app.post('/api/auth/login', async (req, res) => {
 // FORGOT PASSWORD (phone + OTP)
 // =========================
 //
-// NOTE: This generates a real, time-limited OTP and stores it (hashed-free,
-// since it's short-lived) on the user document. Right now it does NOT send
-// a real SMS — it logs the code to the server console (visible in your
-// Render logs) so you can test the full flow today. To go live with real
-// SMS, swap the console.log line in /forgot-password/request-otp for a call
-// to a provider like Twilio or MSG91 using the same `otp` and `phone`.
-
-// STEP 1: request an OTP for a phone number
-app.post('/api/auth/forgot-password/request-otp', async (req, res) => {
-  try {
-    const { phone } = req.body;
-
-    if (!phone || !/^[0-9]{10}$/.test(phone)) {
-      return res.status(400).json({
-        error: 'Please provide a valid 10-digit phone number',
-      });
-    }
-
-    const user = await User.findOne({ phone });
-
-    if (!user) {
-      return res.status(404).json({
-        error: 'No account found with that mobile number',
-      });
-    }
-
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-    const expires = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
-
-    user.resetOtp = otp;
-    user.resetOtpExpires = expires;
-    await user.save();
-
-    // TODO: replace this with a real SMS provider call (Twilio, MSG91, etc.)
-    console.log(`[OTP] Password reset code for ${phone}: ${otp} (expires ${expires.toISOString()})`);
-
-    res.json({
-      message: 'A verification code has been sent to your registered mobile number.',
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// STEP 2: verify the OTP
-app.post('/api/auth/forgot-password/verify-otp', async (req, res) => {
-  try {
-    const { phone, otp } = req.body;
-
-    if (!phone || !otp) {
-      return res.status(400).json({ error: 'Phone and code are required' });
-    }
-
-    const user = await User.findOne({ phone });
-
-    if (!user || !user.resetOtp || !user.resetOtpExpires) {
-      return res.status(400).json({ error: 'No reset request found for this number' });
-    }
-
-    if (user.resetOtpExpires < new Date()) {
-      return res.status(400).json({ error: 'This code has expired. Please request a new one.' });
-    }
-
-    if (user.resetOtp !== otp) {
-      return res.status(400).json({ error: 'Incorrect code' });
-    }
-
-    res.json({ message: 'Code verified successfully' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// STEP 3: set the new password (re-checks the OTP for safety)
-app.post('/api/auth/forgot-password/reset', async (req, res) => {
-  try {
-    const { phone, otp, newPassword } = req.body;
-
-    if (!phone || !otp || !newPassword) {
-      return res.status(400).json({ error: 'Phone, code, and new password are required' });
-    }
-
-    if (newPassword.length < 6) {
-      return res.status(400).json({ error: 'Password must be at least 6 characters' });
-    }
-
-    const user = await User.findOne({ phone });
-
-    if (!user || !user.resetOtp || !user.resetOtpExpires) {
-      return res.status(400).json({ error: 'No reset request found for this number' });
-    }
-
-    if (user.resetOtpExpires < new Date()) {
-      return res.status(400).json({ error: 'This code has expired. Please request a new one.' });
-    }
-
-    if (user.resetOtp !== otp) {
-      return res.status(400).json({ error: 'Incorrect code' });
-    }
-
-    user.password = await bcrypt.hash(newPassword, 10);
-    user.resetOtp = null;
-    user.resetOtpExpires = null;
-    await user.save();
-
-    res.json({ message: 'Password has been reset successfully' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// =========================
-// FORGOT PASSWORD (phone + OTP)
-// =========================
-//
 // Flow:
 //  1. POST /api/auth/forgot-password/request-otp   { phone }
 //     -> generates a 6-digit OTP, stores a HASH of it (never the raw code)
@@ -334,6 +209,12 @@ app.post('/api/auth/forgot-password/reset', async (req, res) => {
 //  3. POST /api/auth/forgot-password/reset          { phone, otp, newPassword }
 //     -> re-verifies the OTP one last time, then sets the new (bcrypt-hashed)
 //        password and clears the OTP fields so it can't be reused.
+//
+// NOTE: an earlier, duplicate set of these three routes used to exist above
+// this block, storing the OTP in plain text (`resetOtp`). Express only ever
+// dispatches to the FIRST matching route handler, so that plain-text version
+// silently shadowed this hashed one and ran on every request instead of it.
+// It has been removed — this hashed version is now the only implementation.
 
 const OTP_EXPIRY_MS = 10 * 60 * 1000; // 10 minutes
 
@@ -498,8 +379,6 @@ const optionalAuth = (req, res, next) => {
       req.user = decoded;
     }
   } catch (err) {
-    // Invalid/expired token on a guest route — just proceed as a guest
-    // rather than failing the whole request.
     req.user = null;
   }
   next();
@@ -507,26 +386,7 @@ const optionalAuth = (req, res, next) => {
 
 // Ensures every cart-related request has a guest session ID. Reads it from
 // an HTTP-only cookie if present; otherwise generates a new cryptographically
-// random ID and sets the cookie for next time. The cookie is HTTP-only
-// (unreadable by JS, protecting it from XSS) and persists for a year so a
-// returning customer's cart survives a closed browser, not just a refresh.
-//
-// This is the ONLY identity a guest shopper has — there is no login — so
-// this single cookie is what makes "the backend owns the cart" possible
-// instead of trusting localStorage.
-//
-// Cookie attributes depend on environment:
-//   Production (NODE_ENV=production): secure + sameSite "none", required
-//     for a cross-site cookie to be sent between your frontend's domain and
-//     this backend's Render domain over HTTPS.
-//   Development: secure must be false and sameSite "lax", because
-//     `http://localhost` is not HTTPS — a `secure` cookie would silently
-//     never be set on plain HTTP, breaking the cart with no visible error.
-// Note: pages opened directly via file:// cannot reliably receive cookies
-// at all regardless of these settings — that's a browser-level restriction
-// on the file:// protocol, not something fixable from the server side.
-// Run the frontend through a local dev server (e.g. `npx http-server`,
-// VS Code "Live Server") to test the cart properly before deployment.
+// random ID and sets the cookie for next time.
 const isProd = process.env.NODE_ENV === 'production';
 const COOKIE_NAME = 'mt_guest_id';
 const ensureGuestSession = (req, res, next) => {
@@ -674,21 +534,21 @@ app.post(
   }
 });
 
-// ----- FIXED: UPDATE product with explicit field mapping and logging -----
+// UPDATE product with explicit field mapping (including stockStatus)
 app.put(
   '/api/products/:id',
   authenticateToken,
   adminOnly,
   async (req, res) => {
     try {
-      console.log('📦 Updating product with body:', req.body);
-
       const product = await Product.findById(req.params.id);
       if (!product) {
         return res.status(404).json({ error: 'Product not found' });
       }
 
-      // Explicitly map every field from request body (or keep existing)
+      // Explicitly map every field from request body (or keep existing).
+      // stockStatus MUST be included here, or an admin edit that only
+      // changes the stock dropdown silently has no effect.
       product.name = req.body.name !== undefined ? req.body.name : product.name;
       product.category = req.body.category !== undefined ? req.body.category : product.category;
       product.price = req.body.price !== undefined ? req.body.price : product.price;
@@ -702,7 +562,6 @@ app.put(
 
       await product.save();
 
-      console.log('✅ Updated product:', product);
       res.json(product);
     } catch (err) {
       console.error('Update error:', err);
@@ -850,22 +709,7 @@ app.delete('/api/admin/delivery-charges/:id', authenticateToken, adminOnly, asyn
 // =========================
 // CART ROUTES
 // =========================
-//
-// The cart is the backend's source of truth. The frontend may cache a copy
-// in localStorage purely for instant UI rendering, but every price, stock
-// check, and total shown to the customer should come from these endpoints,
-// not be computed client-side from cached data — otherwise nothing stops a
-// shopper from editing localStorage to change a price.
-//
-// Carts are keyed on the guest session cookie (see ensureGuestSession
-// above). If customer accounts are added later, a login step can look up
-// the guest's cart by guestId and either attach `user` to it directly or
-// merge its items into an existing user cart — no schema change required,
-// since `user` already exists on the Cart model for exactly this purpose.
 
-// Helper: build a cart response with live product data resolved in
-// (price, name, image, stock), rather than trusting anything stored on the
-// cart document itself except product ID + quantity.
 async function buildCartResponse(cart) {
   const items = [];
   let subtotal = 0;
@@ -873,8 +717,6 @@ async function buildCartResponse(cart) {
   for (const entry of cart.items) {
     const product = await Product.findById(entry.product);
     if (!product) {
-      // Product was deleted since being added to cart — skip it silently;
-      // the frontend will simply no longer see it in the cart.
       continue;
     }
     const lineSubtotal = product.price * entry.quantity;
@@ -1026,10 +868,6 @@ app.delete('/api/cart', ensureGuestSession, async (req, res) => {
 // =========================
 // ORDER ROUTES
 // =========================
-//
-// Checkout always goes through the cart — it is read fresh from the
-// database, never trusted from the request body. This is what prevents a
-// shopper from posting a fake price/quantity directly to /api/orders.
 
 // CREATE an order from the current cart (public — guest checkout, COD)
 app.post('/api/orders/checkout', ensureGuestSession, optionalAuth, async (req, res) => {
@@ -1356,10 +1194,6 @@ app.put('/api/orders/:id/status', authenticateToken, adminOnly, async (req, res)
 // =========================
 // DASHBOARD / ANALYTICS ROUTES (admin only)
 // =========================
-// All figures below are computed live from real Order/Product documents.
-// If there is no data yet, totals come back as 0 / empty arrays — the
-// frontend is responsible for showing a truthful "No orders yet" state
-// rather than inventing placeholder numbers.
 
 app.get('/api/admin/dashboard-stats', authenticateToken, adminOnly, async (req, res) => {
   try {
@@ -1369,8 +1203,6 @@ app.get('/api/admin/dashboard-stats', authenticateToken, adminOnly, async (req, 
     const totalRevenue = orders.reduce((sum, o) => sum + o.grandTotal, 0);
     const totalOrders = orders.length;
 
-    // Monthly revenue + order counts for the last 6 calendar months
-    // (including the current month), oldest first.
     const monthly = [];
     const now = new Date();
     for (let i = 5; i >= 0; i--) {
@@ -1387,16 +1219,11 @@ app.get('/api/admin/dashboard-stats', authenticateToken, adminOnly, async (req, 
       });
     }
 
-    // Category breakdown by revenue share, computed from order line items.
-    const categoryRevenue = {}; // categoryName -> revenue
-    const productSales = {};    // productId -> { name, category, sold, rev }
+    const categoryRevenue = {};
+    const productSales = {};
 
     for (const order of orders) {
       for (const item of order.items) {
-        // We only stored name/price snapshots on the order item, not
-        // category — so look the category up from the live product when
-        // available (falls back to "Uncategorised" if the product was
-        // since deleted).
         const prod = await Product.findById(item.product).lean();
         const category = prod ? prod.category : 'Uncategorised';
 
@@ -1444,7 +1271,7 @@ app.get('/api/admin/customers', authenticateToken, adminOnly, async (req, res) =
   try {
     const orders = await Order.find().sort({ createdAt: -1 });
 
-    const customerMap = {}; // customerKey -> aggregated customer record
+    const customerMap = {};
 
     for (const order of orders) {
       const key = order.customerKey;
@@ -1489,15 +1316,12 @@ async function startServer() {
   try {
     console.log('Attempting MongoDB connection...');
 
-await mongoose.connect(process.env.MONGO_URI, {
-  serverSelectionTimeoutMS: 8000,
-});
+    await mongoose.connect(process.env.MONGO_URI, {
+      serverSelectionTimeoutMS: 8000,
+    });
 
-console.log('MongoDB connection completed');
-
-    console.log(
-      'MongoDB Atlas connected successfully for Maas Trends!'
-    );
+    console.log('MongoDB connection completed');
+    console.log('MongoDB Atlas connected successfully for Maas Trends!');
 
     app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
