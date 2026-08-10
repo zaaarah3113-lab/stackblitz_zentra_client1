@@ -48,6 +48,7 @@ app.use(cors({
 }));
 // Razorpay webhook signature verification requires the raw request body.
 app.use('/api/razorpay/webhook', express.raw({ type: 'application/json' }));
+app.use('/api/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(cookieParser());
 app.options('*', cors({
@@ -435,6 +436,20 @@ async function resolveDeliveryCharge(pincode) {
   };
 }
 
+// Admin only manages the text `stockStatus` dropdown, not a real quantity —
+// so availability must be gated on `stockStatus`, not on the numeric `stock`
+// field. `stock` is only enforced as a cap when it's actually being tracked
+// (i.e. greater than 0); a value of 0 on an "In Stock" product is treated as
+// "quantity not tracked" rather than "nothing left".
+function assertPurchasable(product, requestedQty) {
+  if (product.stockStatus === 'Out of Stock') {
+    throw new Error(`"${product.name}" is currently out of stock.`);
+  }
+  if (product.stock > 0 && requestedQty > product.stock) {
+    throw new Error(`Only ${product.stock} of "${product.name}" left in stock.`);
+  }
+}
+
 async function buildOrderItemsFromCart(cart, session) {
   const orderItems = [];
   let subtotal = 0;
@@ -444,9 +459,7 @@ async function buildOrderItemsFromCart(cart, session) {
     if (!product) {
       throw new Error('One of the items in your cart is no longer available.');
     }
-    if (product.stock < cartItem.quantity) {
-      throw new Error(`Not enough stock for "${product.name}". Only ${product.stock} left.`);
-    }
+    assertPurchasable(product, cartItem.quantity);
 
     const lineSubtotal = product.price * cartItem.quantity;
     subtotal += lineSubtotal;
@@ -470,10 +483,19 @@ async function decrementStockForOrderItems(orderItems, session) {
     if (!product) {
       throw new Error('One of the items in your order is no longer available.');
     }
-    if (product.stock < item.quantity) {
-      throw new Error(`Not enough stock for "${product.name}". Only ${product.stock} left.`);
+    assertPurchasable(product, item.quantity);
+
+    // Only decrement when a real quantity is being tracked. Untracked
+    // ("stock: 0" on an In Stock product) stays as-is instead of going
+    // negative — availability there is controlled entirely by stockStatus.
+    if (product.stock > 0) {
+      product.stock -= item.quantity;
+      if (product.stock === 0) {
+        product.stockStatus = 'Out of Stock';
+      } else if (product.stock <= 5) {
+        product.stockStatus = 'Low Stock';
+      }
     }
-    product.stock -= item.quantity;
     await product.save({ session });
   }
 }
@@ -775,10 +797,10 @@ app.post('/api/cart/items', ensureGuestSession, async (req, res) => {
     const existing = cart.items.find(i => String(i.product) === String(productId));
     const newQty = (existing ? existing.quantity : 0) + qty;
 
-    if (newQty > product.stock) {
-      return res.status(400).json({
-        error: `Only ${product.stock} of "${product.name}" left in stock.`,
-      });
+    try {
+      assertPurchasable(product, newQty);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
     }
 
     if (existing) {
@@ -816,10 +838,10 @@ app.put('/api/cart/items/:productId', ensureGuestSession, async (req, res) => {
       if (!product) {
         return res.status(404).json({ error: 'Product not found.' });
       }
-      if (qty > product.stock) {
-        return res.status(400).json({
-          error: `Only ${product.stock} of "${product.name}" left in stock.`,
-        });
+      try {
+        assertPurchasable(product, qty);
+      } catch (err) {
+        return res.status(400).json({ error: err.message });
       }
       const existing = cart.items.find(i => String(i.product) === req.params.productId);
       if (existing) {
@@ -1053,8 +1075,16 @@ app.get('/api/orders/:id/payment-status', async (req, res) => {
   }
 });
 
-// Razorpay webhook — verifies signature and marks order as paid
-app.post('/api/razorpay/webhook', async (req, res) => {
+// Razorpay webhook — verifies signature and marks order as paid.
+// Mounted at both /api/razorpay/webhook (existing) and /api/webhook (alias),
+// so whichever URL is configured in the Razorpay Dashboard works.
+//
+// Signature verification hashes the RAW request bytes, not
+// JSON.stringify(req.body). Re-serializing the parsed body is unreliable —
+// key ordering/whitespace can differ from what Razorpay originally signed,
+// which makes genuinely valid webhooks fail verification. `express.raw()`
+// above preserves the exact bytes for these two paths for that reason.
+async function razorpayWebhookHandler(req, res) {
   try {
     const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
     if (!webhookSecret) {
@@ -1062,75 +1092,87 @@ app.post('/api/razorpay/webhook', async (req, res) => {
     }
 
     const signature = req.headers['x-razorpay-signature'];
-    const rawBody = req.body;
+    const rawBody = req.body; // Buffer — see express.raw() above
+
     const expectedSignature = crypto
       .createHmac('sha256', webhookSecret)
       .update(rawBody)
       .digest('hex');
 
-    if (signature !== expectedSignature) {
+    const signatureValid =
+      typeof signature === 'string' &&
+      signature.length === expectedSignature.length &&
+      crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSignature));
+
+    if (!signatureValid) {
       return res.status(400).json({ error: 'Invalid webhook signature.' });
     }
 
     const event = JSON.parse(rawBody.toString('utf8'));
     const eventType = event.event;
 
-    if (eventType === 'payment.captured') {
-      const payment = event.payload.payment.entity;
-      const razorpayOrderId = payment.order_id;
+    if (eventType === 'order.paid' || eventType === 'payment.captured') {
+      const payment = event.payload && event.payload.payment && event.payload.payment.entity;
+      const razorpayOrderId = payment && payment.order_id;
+
+      if (!razorpayOrderId) {
+        // Malformed payload — acknowledge so Razorpay doesn't retry forever.
+        return res.status(200).json({ status: 'ok' });
+      }
 
       const order = await Order.findOne({ razorpayOrderId });
       if (!order) {
-        return res.status(404).json({ error: 'Order not found for Razorpay order.' });
+        return res.status(200).json({ status: 'ok' });
       }
 
-      if (order.paymentStatus === 'paid') {
-        return res.json({ status: 'already_processed' });
+      if (order.paymentStatus !== 'paid') {
+        const session = await mongoose.startSession();
+        try {
+          await session.withTransaction(async () => {
+            await decrementStockForOrderItems(order.items, session);
+
+            order.paymentStatus = 'paid';
+            order.orderStatus = 'order_placed';
+            order.razorpayPaymentId = payment.id;
+            order.razorpaySignature = signature;
+            await order.save({ session });
+
+            if (order.guestId) {
+              await Cart.findOneAndUpdate(
+                { guestId: order.guestId },
+                { items: [] },
+                { session }
+              );
+            }
+          });
+        } finally {
+          session.endSession();
+        }
       }
 
-      const session = await mongoose.startSession();
-      try {
-        await session.withTransaction(async () => {
-          await decrementStockForOrderItems(order.items, session);
-
-          order.paymentStatus = 'paid';
-          order.orderStatus = 'order_placed';
-          order.razorpayPaymentId = payment.id;
-          order.razorpaySignature = signature;
-          await order.save({ session });
-
-          if (order.guestId) {
-            await Cart.findOneAndUpdate(
-              { guestId: order.guestId },
-              { items: [] },
-              { session }
-            );
-          }
-        });
-      } finally {
-        session.endSession();
-      }
-
-      return res.json({ status: 'paid' });
+      return res.status(200).json({ status: 'ok' });
     }
 
     if (eventType === 'payment.failed') {
-      const payment = event.payload.payment.entity;
-      const order = await Order.findOne({ razorpayOrderId: payment.order_id });
+      const payment = event.payload && event.payload.payment && event.payload.payment.entity;
+      const order = payment && await Order.findOne({ razorpayOrderId: payment.order_id });
       if (order && order.paymentStatus !== 'paid') {
         order.paymentStatus = 'failed';
         order.orderStatus = 'cancelled';
         await order.save();
       }
-      return res.json({ status: 'failed_recorded' });
+      return res.status(200).json({ status: 'ok' });
     }
 
-    res.json({ status: 'ignored' });
+    return res.status(200).json({ status: 'ok' });
   } catch (err) {
     console.error('Razorpay webhook error:', err);
     res.status(500).json({ error: err.message });
   }
-});
+}
+
+app.post('/api/razorpay/webhook', razorpayWebhookHandler);
+app.post('/api/webhook', razorpayWebhookHandler);
 
 // LIST all orders (admin only)
 app.get('/api/orders', authenticateToken, adminOnly, async (req, res) => {
