@@ -14,6 +14,7 @@ const User = require('./userModel');
 const Order = require('./orderModel');
 const Cart = require('./cartModel');
 const DeliveryCharge = require('./deliveryChargeModel');
+const Category = require('./categoryModel');
 const { getSetting, setSetting } = require('./settingsModel');
 const { getNextSequence } = require('./counterModel');
 
@@ -616,6 +617,79 @@ app.delete(
     res.status(500).json({
       error: err.message,
     });
+  }
+});
+
+// =========================
+// CATEGORY ROUTES
+// =========================
+// Categories used to be a hardcoded list baked into both the admin form and
+// the storefront filter buttons, which is why adding/removing a category
+// meant editing HTML in two different places (and why the two lists could
+// drift out of sync). They now live in their own collection that the admin
+// manages, and everyone else (storefront + admin dropdowns) reads from here.
+
+const DEFAULT_CATEGORY_NAMES = ['Saree', 'Nighty', 'Hijab', '3-Piece Set', 'Anarkali'];
+
+// One-time migration safety net: if the Category collection is empty (e.g.
+// on first deploy of this feature), seed it with the categories that used
+// to be hardcoded, so existing products don't lose their filter tab.
+async function ensureDefaultCategoriesSeeded() {
+  const count = await Category.countDocuments();
+  if (count > 0) return;
+  try {
+    await Category.insertMany(
+      DEFAULT_CATEGORY_NAMES.map((name) => ({ name })),
+      { ordered: false }
+    );
+  } catch (err) {
+    // Ignore duplicate-key races if two requests seed at the same time.
+  }
+}
+
+// Public: list all categories — used by the storefront to render filter
+// tabs and by the admin panel to populate its dropdowns.
+app.get('/api/categories', async (req, res) => {
+  try {
+    await ensureDefaultCategoriesSeeded();
+    const categories = await Category.find().sort({ name: 1 });
+    res.json(categories);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: create a new category
+app.post('/api/admin/categories', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const name = String(req.body.name || '').trim();
+    if (!name) {
+      return res.status(400).json({ error: 'Category name is required.' });
+    }
+    const slug = Category.slugifyCategory(name);
+    const existing = await Category.findOne({ slug });
+    if (existing) {
+      return res.status(400).json({ error: 'A category with that name already exists.' });
+    }
+    const category = await Category.create({ name });
+    res.status(201).json(category);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Admin: delete a category. Products already tagged with it keep their
+// text value (nothing is deleted from Product docs) — they'll just show
+// under "All" until re-categorized, since the tab for it is gone.
+app.delete('/api/admin/categories/:id', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const category = await Category.findByIdAndDelete(req.params.id);
+    if (!category) {
+      return res.status(404).json({ error: 'Category not found.' });
+    }
+    res.json({ message: 'Category deleted successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
