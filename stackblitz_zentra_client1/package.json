@@ -1,7 +1,7 @@
 {
   "name": "maastrends-backend",
   "version": "1.0.0",
-  "description": "Backend API server for Zentra Trends",
+  "description": "Backend API server for Maas Trends",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"

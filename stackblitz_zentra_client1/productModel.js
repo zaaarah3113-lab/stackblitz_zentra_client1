@@ -43,10 +43,6 @@ const productSchema = new mongoose.Schema({
     enum: ['In Stock', 'Low Stock', 'Out of Stock'],
     default: 'In Stock',
   },
-  isNewArrival: {
-    type: Boolean,
-    default: false,
-  },
 }, { timestamps: true });
 
 // The Admin portal only ever sets `stockStatus` (a text dropdown) — it never

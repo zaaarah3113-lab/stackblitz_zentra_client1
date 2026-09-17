@@ -14,6 +14,7 @@ const User = require('./userModel');
 const Order = require('./orderModel');
 const Cart = require('./cartModel');
 const DeliveryCharge = require('./deliveryChargeModel');
+const Category = require('./categoryModel');
 const { getSetting, setSetting } = require('./settingsModel');
 const { getNextSequence } = require('./counterModel');
 
@@ -98,7 +99,7 @@ async function createRazorpayOrder(payload) {
 app.get('/api/test', (req, res) => {
   res.json({
     message:
-      'Welcome to Zentra Trends Backend! The cloud server is running beautifully!',
+      'Welcome to Maas Trends Backend! The cloud server is running beautifully!',
   });
 });
 
@@ -581,11 +582,6 @@ app.put(
       product.image = req.body.image !== undefined ? req.body.image : product.image;
       product.fabric = req.body.fabric !== undefined ? req.body.fabric : product.fabric;
       product.care = req.body.care !== undefined ? req.body.care : product.care;
-      // isNewArrival was missing from this explicit whitelist — any edit to
-      // an existing product (not just its initial creation) silently failed
-      // to persist the "Show in New Arrivals" checkbox. Fixed by mapping it
-      // the same way as every other field above.
-      product.isNewArrival = req.body.isNewArrival !== undefined ? req.body.isNewArrival : product.isNewArrival;
 
       await product.save();
 
@@ -621,6 +617,79 @@ app.delete(
     res.status(500).json({
       error: err.message,
     });
+  }
+});
+
+// =========================
+// CATEGORY ROUTES
+// =========================
+// Categories used to be a hardcoded list baked into both the admin form and
+// the storefront filter buttons, which is why adding/removing a category
+// meant editing HTML in two different places (and why the two lists could
+// drift out of sync). They now live in their own collection that the admin
+// manages, and everyone else (storefront + admin dropdowns) reads from here.
+
+const DEFAULT_CATEGORY_NAMES = ['Saree', 'Nighty', 'Hijab', '3-Piece Set', 'Anarkali'];
+
+// One-time migration safety net: if the Category collection is empty (e.g.
+// on first deploy of this feature), seed it with the categories that used
+// to be hardcoded, so existing products don't lose their filter tab.
+async function ensureDefaultCategoriesSeeded() {
+  const count = await Category.countDocuments();
+  if (count > 0) return;
+  try {
+    await Category.insertMany(
+      DEFAULT_CATEGORY_NAMES.map((name) => ({ name })),
+      { ordered: false }
+    );
+  } catch (err) {
+    // Ignore duplicate-key races if two requests seed at the same time.
+  }
+}
+
+// Public: list all categories — used by the storefront to render filter
+// tabs and by the admin panel to populate its dropdowns.
+app.get('/api/categories', async (req, res) => {
+  try {
+    await ensureDefaultCategoriesSeeded();
+    const categories = await Category.find().sort({ name: 1 });
+    res.json(categories);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: create a new category
+app.post('/api/admin/categories', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const name = String(req.body.name || '').trim();
+    if (!name) {
+      return res.status(400).json({ error: 'Category name is required.' });
+    }
+    const slug = Category.slugifyCategory(name);
+    const existing = await Category.findOne({ slug });
+    if (existing) {
+      return res.status(400).json({ error: 'A category with that name already exists.' });
+    }
+    const category = await Category.create({ name });
+    res.status(201).json(category);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Admin: delete a category. Products already tagged with it keep their
+// text value (nothing is deleted from Product docs) — they'll just show
+// under "All" until re-categorized, since the tab for it is gone.
+app.delete('/api/admin/categories/:id', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const category = await Category.findByIdAndDelete(req.params.id);
+    if (!category) {
+      return res.status(404).json({ error: 'Category not found.' });
+    }
+    res.json({ message: 'Category deleted successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -1286,7 +1355,7 @@ app.get('/api/admin/dashboard-stats', authenticateToken, adminOnly, async (req, 
     }
 
     const totalCategoryRevenue = Object.values(categoryRevenue).reduce((a, b) => a + b, 0);
-    const palette = ['#4c1d80', '#9333ea', '#c8a96e', '#3b82f6', '#e24b4a', '#8b5cf6', '#f59e0b'];
+    const palette = ['#0d5c45', '#2db892', '#c8a96e', '#3b82f6', '#e24b4a', '#8b5cf6', '#f59e0b'];
     const categories = Object.entries(categoryRevenue)
       .sort((a, b) => b[1] - a[1])
       .map(([c, rev], idx) => ({
@@ -1368,7 +1437,7 @@ async function startServer() {
     });
 
     console.log('MongoDB connection completed');
-    console.log('MongoDB Atlas connected successfully for Zentra Trends!');
+    console.log('MongoDB Atlas connected successfully for Maas Trends!');
 
     app.listen(PORT, () => {
       console.log(`Server is running on port ${PORT}`);
