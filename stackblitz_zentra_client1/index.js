@@ -1,0 +1,1384 @@
+console.log('SCRIPT STARTED - LINE 1');
+
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const cookieParser = require('cookie-parser');
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+
+const Product = require('./productModel');
+const User = require('./userModel');
+const Order = require('./orderModel');
+const Cart = require('./cartModel');
+const DeliveryCharge = require('./deliveryChargeModel');
+const { getSetting, setSetting } = require('./settingsModel');
+const { getNextSequence } = require('./counterModel');
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+
+// ── CORS configuration ──
+const DEV_ORIGINS = [
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://localhost:5500',
+  'http://127.0.0.1:5500',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:8080',
+  'http://localhost:8080',
+];
+const allowedOrigins = [
+  ...(process.env.FRONTEND_URL ? [process.env.FRONTEND_URL] : []),
+  ...DEV_ORIGINS,
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin || origin === 'null' || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS blocked for origin: ${origin}`));
+    }
+  },
+  credentials: true,
+}));
+// Razorpay webhook signature verification requires the raw request body.
+app.use('/api/razorpay/webhook', express.raw({ type: 'application/json' }));
+app.use('/api/webhook', express.raw({ type: 'application/json' }));
+app.use(express.json());
+app.use(cookieParser());
+app.options('*', cors({
+  origin: function (origin, callback) {
+    if (!origin || origin === 'null' || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error(`CORS blocked for origin: ${origin}`));
+    }
+  },
+  credentials: true,
+}));
+
+function getRazorpayAuthHeader() {
+  if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+    return null;
+  }
+  const token = Buffer.from(
+    `${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`
+  ).toString('base64');
+  return `Basic ${token}`;
+}
+
+async function createRazorpayOrder(payload) {
+  const authHeader = getRazorpayAuthHeader();
+  if (!authHeader) {
+    throw new Error('Razorpay is not configured on the server.');
+  }
+
+  const response = await fetch('https://api.razorpay.com/v1/orders', {
+    method: 'POST',
+    headers: {
+      Authorization: authHeader,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error?.description || data.error || 'Failed to create Razorpay order.');
+  }
+  return data;
+}
+
+// Base Testing Route
+app.get('/api/test', (req, res) => {
+  res.json({
+    message:
+      'Welcome to Zentra Trends Backend! The cloud server is running beautifully!',
+  });
+});
+
+
+// =========================
+// AUTH ROUTES
+// =========================
+
+// SIGNUP
+app.post('/api/auth/signup', async (req, res) => {
+  try {
+    const { name, email, password } = req.body;
+
+    const existingUser = await User.findOne({ email });
+
+    if (existingUser) {
+      return res.status(400).json({
+        error: 'User already exists',
+      });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const user = await User.create({
+      name,
+      email,
+      password: hashedPassword,
+    });
+
+    res.status(201).json({
+      message: 'User created successfully',
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err.message,
+    });
+  }
+});
+
+// LOGIN
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    const user = await User.findOne({ email });
+
+    if (!user) {
+      return res.status(400).json({
+        error: 'Invalid credentials',
+      });
+    }
+
+    const passwordMatch = await bcrypt.compare(
+      password,
+      user.password
+    );
+
+    if (!passwordMatch) {
+      return res.status(400).json({
+        error: 'Invalid credentials',
+      });
+    }
+
+    const token = jwt.sign(
+      {
+        id: user._id,
+        role: user.role,
+      },
+      process.env.JWT_SECRET,
+      {
+        expiresIn: '7d',
+      }
+    );
+
+    res.json({
+      message: 'Login successful',
+      token,
+      user: {
+        id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err.message,
+    });
+  }
+});
+
+// =========================
+// FORGOT PASSWORD (phone + OTP)
+// =========================
+//
+// Flow:
+//  1. POST /api/auth/forgot-password/request-otp   { phone }
+//     -> generates a 6-digit OTP, stores a HASH of it (never the raw code)
+//        with a 10-minute expiry, and "sends" it (currently logs it to the
+//        server console — wire up Twilio/MSG91/etc. here later).
+//  2. POST /api/auth/forgot-password/verify-otp     { phone, otp }
+//     -> checks the OTP against the stored hash and expiry.
+//  3. POST /api/auth/forgot-password/reset          { phone, otp, newPassword }
+//     -> re-verifies the OTP one last time, then sets the new (bcrypt-hashed)
+//        password and clears the OTP fields so it can't be reused.
+//
+// NOTE: an earlier, duplicate set of these three routes used to exist above
+// this block, storing the OTP in plain text (`resetOtp`). Express only ever
+// dispatches to the FIRST matching route handler, so that plain-text version
+// silently shadowed this hashed one and ran on every request instead of it.
+// It has been removed — this hashed version is now the only implementation.
+
+const OTP_EXPIRY_MS = 10 * 60 * 1000; // 10 minutes
+
+function generateOtp() {
+  // 6-digit numeric code, e.g. "048213"
+  return crypto.randomInt(0, 1000000).toString().padStart(6, '0');
+}
+
+function hashOtp(otp) {
+  return crypto.createHash('sha256').update(otp).digest('hex');
+}
+
+// STEP 1 — request a code
+app.post('/api/auth/forgot-password/request-otp', async (req, res) => {
+  try {
+    const { phone } = req.body;
+
+    if (!phone || !/^[0-9]{10}$/.test(phone)) {
+      return res.status(400).json({ error: 'Please provide a valid 10-digit mobile number.' });
+    }
+
+    const user = await User.findOne({ phone });
+
+    if (!user) {
+      return res.status(404).json({ error: 'No account found with that mobile number.' });
+    }
+
+    const otp = generateOtp();
+    user.resetOtpHash = hashOtp(otp);
+    user.resetOtpExpires = new Date(Date.now() + OTP_EXPIRY_MS);
+    await user.save();
+
+    // TODO: replace this console.log with a real SMS provider call
+    // (e.g. Twilio, MSG91, Fast2SMS) once you have an account set up.
+    console.log(`[OTP] Password reset code for ${phone}: ${otp} (expires in 10 min)`);
+
+    res.json({ message: 'OTP sent to your registered mobile number.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// STEP 2 — verify the code
+app.post('/api/auth/forgot-password/verify-otp', async (req, res) => {
+  try {
+    const { phone, otp } = req.body;
+
+    if (!phone || !otp) {
+      return res.status(400).json({ error: 'Phone and OTP are required.' });
+    }
+
+    const user = await User.findOne({ phone });
+
+    if (!user || !user.resetOtpHash || !user.resetOtpExpires) {
+      return res.status(400).json({ error: 'No reset request found. Please request a new code.' });
+    }
+
+    if (user.resetOtpExpires.getTime() < Date.now()) {
+      return res.status(400).json({ error: 'This code has expired. Please request a new one.' });
+    }
+
+    if (hashOtp(otp) !== user.resetOtpHash) {
+      return res.status(400).json({ error: 'Incorrect code. Please try again.' });
+    }
+
+    res.json({ message: 'Code verified.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// STEP 3 — set the new password
+app.post('/api/auth/forgot-password/reset', async (req, res) => {
+  try {
+    const { phone, otp, newPassword } = req.body;
+
+    if (!phone || !otp || !newPassword) {
+      return res.status(400).json({ error: 'Phone, OTP, and new password are all required.' });
+    }
+
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+    }
+
+    const user = await User.findOne({ phone });
+
+    if (!user || !user.resetOtpHash || !user.resetOtpExpires) {
+      return res.status(400).json({ error: 'No reset request found. Please request a new code.' });
+    }
+
+    if (user.resetOtpExpires.getTime() < Date.now()) {
+      return res.status(400).json({ error: 'This code has expired. Please request a new one.' });
+    }
+
+    if (hashOtp(otp) !== user.resetOtpHash) {
+      return res.status(400).json({ error: 'Incorrect code.' });
+    }
+
+    user.password = await bcrypt.hash(newPassword, 10);
+    user.resetOtpHash = null;
+    user.resetOtpExpires = null;
+    await user.save();
+
+    res.json({ message: 'Password has been reset successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =========================
+// AUTH MIDDLEWARE
+// =========================
+
+const authenticateToken = (req, res, next) => {
+  try {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        error: 'Access denied. No token provided.',
+      });
+    }
+
+    const token = authHeader.split(' ')[1];
+
+    const decoded = jwt.verify(
+      token,
+      process.env.JWT_SECRET
+    );
+
+    req.user = decoded;
+
+    next();
+  } catch (err) {
+    return res.status(401).json({
+      error: 'Invalid or expired token',
+    });
+  }
+};
+
+const adminOnly = (req, res, next) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({
+      error: 'Admin access required',
+    });
+  }
+
+  next();
+};
+
+// Like authenticateToken, but never blocks the request if no/invalid token
+// is present — it just leaves req.user as null. Used on guest-checkout
+// routes so a logged-in account still gets linked to its order, without
+// forcing every customer to have one.
+const optionalAuth = (req, res, next) => {
+  req.user = null;
+  try {
+    const authHeader = req.headers.authorization;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const token = authHeader.split(' ')[1];
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      req.user = decoded;
+    }
+  } catch (err) {
+    req.user = null;
+  }
+  next();
+};
+
+// Ensures every cart-related request has a guest session ID. Reads it from
+// an HTTP-only cookie if present; otherwise generates a new cryptographically
+// random ID and sets the cookie for next time.
+const isProd = process.env.NODE_ENV === 'production';
+const COOKIE_NAME = 'mt_guest_id';
+const ensureGuestSession = (req, res, next) => {
+  let guestId = req.cookies[COOKIE_NAME];
+
+  if (!guestId) {
+    guestId = crypto.randomBytes(24).toString('hex');
+    res.cookie(COOKIE_NAME, guestId, {
+      httpOnly: true,
+      secure: isProd,
+      sameSite: isProd ? 'none' : 'lax',
+      maxAge: 365 * 24 * 60 * 60 * 1000, // 1 year
+    });
+  }
+
+  req.guestId = guestId;
+  next();
+};
+
+// =========================
+// DELIVERY CHARGE HELPERS
+// =========================
+
+async function resolveDeliveryCharge(pincode) {
+  const normalized = String(pincode || '').trim();
+  if (!normalized) {
+    throw new Error('Pincode is required.');
+  }
+
+  const entry = await DeliveryCharge.findOne({ pincode: normalized });
+  if (entry) {
+    return {
+      pincode: normalized,
+      areaName: entry.areaName || '',
+      deliveryCharge: entry.deliveryCharge,
+      isDefault: false,
+    };
+  }
+
+  const defaultCharge = await getSetting('default_delivery_charge', 0);
+  return {
+    pincode: normalized,
+    areaName: '',
+    deliveryCharge: Number(defaultCharge) || 0,
+    isDefault: true,
+  };
+}
+
+// Admin only manages the text `stockStatus` dropdown, not a real quantity —
+// so availability must be gated on `stockStatus`, not on the numeric `stock`
+// field. `stock` is only enforced as a cap when it's actually being tracked
+// (i.e. greater than 0); a value of 0 on an "In Stock" product is treated as
+// "quantity not tracked" rather than "nothing left".
+function assertPurchasable(product, requestedQty) {
+  if (product.stockStatus === 'Out of Stock') {
+    throw new Error(`"${product.name}" is currently out of stock.`);
+  }
+  if (product.stock > 0 && requestedQty > product.stock) {
+    throw new Error(`Only ${product.stock} of "${product.name}" left in stock.`);
+  }
+}
+
+async function buildOrderItemsFromCart(cart, session) {
+  const orderItems = [];
+  let subtotal = 0;
+
+  for (const cartItem of cart.items) {
+    const product = await Product.findById(cartItem.product).session(session);
+    if (!product) {
+      throw new Error('One of the items in your cart is no longer available.');
+    }
+    assertPurchasable(product, cartItem.quantity);
+
+    const lineSubtotal = product.price * cartItem.quantity;
+    subtotal += lineSubtotal;
+
+    orderItems.push({
+      product: product._id,
+      name: product.name,
+      image: product.image,
+      price: product.price,
+      quantity: cartItem.quantity,
+      subtotal: lineSubtotal,
+    });
+  }
+
+  return { orderItems, subtotal };
+}
+
+async function decrementStockForOrderItems(orderItems, session) {
+  for (const item of orderItems) {
+    const product = await Product.findById(item.product).session(session);
+    if (!product) {
+      throw new Error('One of the items in your order is no longer available.');
+    }
+    assertPurchasable(product, item.quantity);
+
+    // Only decrement when a real quantity is being tracked. Untracked
+    // ("stock: 0" on an In Stock product) stays as-is instead of going
+    // negative — availability there is controlled entirely by stockStatus.
+    if (product.stock > 0) {
+      product.stock -= item.quantity;
+      if (product.stock === 0) {
+        product.stockStatus = 'Out of Stock';
+      } else if (product.stock <= 5) {
+        product.stockStatus = 'Low Stock';
+      }
+    }
+    await product.save({ session });
+  }
+}
+
+function calculateGrandTotal(subtotal, shippingFee, discount = 0, tax = 0) {
+  return subtotal - discount + shippingFee + tax;
+}
+
+// =========================
+// PRODUCT ROUTES
+// =========================
+
+// GET all products
+app.get('/api/products', async (req, res) => {
+  try {
+    const products = await Product.find();
+    res.json(products);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET one product by ID
+app.get('/api/products/:id', async (req, res) => {
+  try {
+    const product = await Product.findById(req.params.id);
+
+    if (!product) {
+      return res.status(404).json({
+        error: 'Product not found',
+      });
+    }
+
+    res.json(product);
+  } catch (err) {
+    res.status(500).json({
+      error: err.message,
+    });
+  }
+});
+
+// CREATE a new product
+app.post(
+  '/api/products',
+  authenticateToken,
+  adminOnly,
+  async (req, res) => {
+  try {
+    const product = new Product(req.body);
+
+    await product.save();
+
+    res.status(201).json(product);
+  } catch (err) {
+    res.status(400).json({
+      error: err.message,
+    });
+  }
+});
+
+// UPDATE product with explicit field mapping (including stockStatus)
+app.put(
+  '/api/products/:id',
+  authenticateToken,
+  adminOnly,
+  async (req, res) => {
+    try {
+      const product = await Product.findById(req.params.id);
+      if (!product) {
+        return res.status(404).json({ error: 'Product not found' });
+      }
+
+      // Explicitly map every field from request body (or keep existing).
+      // stockStatus MUST be included here, or an admin edit that only
+      // changes the stock dropdown silently has no effect.
+      product.name = req.body.name !== undefined ? req.body.name : product.name;
+      product.category = req.body.category !== undefined ? req.body.category : product.category;
+      product.price = req.body.price !== undefined ? req.body.price : product.price;
+      product.mrp = req.body.mrp !== undefined ? req.body.mrp : product.mrp;
+      product.stock = req.body.stock !== undefined ? req.body.stock : product.stock;
+      product.stockStatus = req.body.stockStatus !== undefined ? req.body.stockStatus : product.stockStatus;
+      product.description = req.body.description !== undefined ? req.body.description : product.description;
+      product.image = req.body.image !== undefined ? req.body.image : product.image;
+      product.fabric = req.body.fabric !== undefined ? req.body.fabric : product.fabric;
+      product.care = req.body.care !== undefined ? req.body.care : product.care;
+      // isNewArrival was missing from this explicit whitelist — any edit to
+      // an existing product (not just its initial creation) silently failed
+      // to persist the "Show in New Arrivals" checkbox. Fixed by mapping it
+      // the same way as every other field above.
+      product.isNewArrival = req.body.isNewArrival !== undefined ? req.body.isNewArrival : product.isNewArrival;
+
+      await product.save();
+
+      res.json(product);
+    } catch (err) {
+      console.error('Update error:', err);
+      res.status(400).json({ error: err.message });
+    }
+  }
+);
+
+// DELETE a product
+app.delete(
+  '/api/products/:id',
+  authenticateToken,
+  adminOnly,
+  async (req, res) => {
+  try {
+    const product = await Product.findByIdAndDelete(
+      req.params.id
+    );
+
+    if (!product) {
+      return res.status(404).json({
+        error: 'Product not found',
+      });
+    }
+
+    res.json({
+      message: 'Product deleted successfully',
+    });
+  } catch (err) {
+    res.status(500).json({
+      error: err.message,
+    });
+  }
+});
+
+// =========================
+// DELIVERY CHARGE ROUTES
+// =========================
+
+// Public lookup — used by customer checkout when pincode is entered
+app.get('/api/delivery-charge', async (req, res) => {
+  try {
+    const { pincode } = req.query;
+    const result = await resolveDeliveryCharge(pincode);
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Admin: list all delivery charge entries (optional pincode search)
+app.get('/api/admin/delivery-charges', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const { search } = req.query;
+    const filter = search
+      ? { pincode: { $regex: String(search).trim(), $options: 'i' } }
+      : {};
+    const entries = await DeliveryCharge.find(filter).sort({ pincode: 1 });
+    res.json(entries);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: get configurable default delivery charge
+app.get('/api/admin/settings/default-delivery-charge', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const value = await getSetting('default_delivery_charge', 0);
+    res.json({ defaultDeliveryCharge: Number(value) || 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin: update default delivery charge
+app.put('/api/admin/settings/default-delivery-charge', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const { defaultDeliveryCharge } = req.body;
+    const charge = Number(defaultDeliveryCharge);
+    if (Number.isNaN(charge) || charge < 0) {
+      return res.status(400).json({ error: 'defaultDeliveryCharge must be a number of 0 or more.' });
+    }
+    await setSetting('default_delivery_charge', charge);
+    res.json({ defaultDeliveryCharge: charge });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Admin: create delivery charge entry
+app.post('/api/admin/delivery-charges', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const { pincode, areaName, deliveryCharge } = req.body;
+    if (!pincode || deliveryCharge === undefined || deliveryCharge === null) {
+      return res.status(400).json({ error: 'pincode and deliveryCharge are required.' });
+    }
+    const entry = await DeliveryCharge.create({
+      pincode: String(pincode).trim(),
+      areaName: areaName || '',
+      deliveryCharge: Number(deliveryCharge),
+    });
+    res.status(201).json(entry);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Admin: update delivery charge entry
+app.put('/api/admin/delivery-charges/:id', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const { pincode, areaName, deliveryCharge } = req.body;
+    const update = {};
+    if (pincode !== undefined) update.pincode = String(pincode).trim();
+    if (areaName !== undefined) update.areaName = areaName;
+    if (deliveryCharge !== undefined) update.deliveryCharge = Number(deliveryCharge);
+
+    const entry = await DeliveryCharge.findByIdAndUpdate(req.params.id, update, {
+      new: true,
+      runValidators: true,
+    });
+
+    if (!entry) {
+      return res.status(404).json({ error: 'Delivery charge entry not found.' });
+    }
+
+    res.json(entry);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Admin: delete delivery charge entry
+app.delete('/api/admin/delivery-charges/:id', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const entry = await DeliveryCharge.findByIdAndDelete(req.params.id);
+    if (!entry) {
+      return res.status(404).json({ error: 'Delivery charge entry not found.' });
+    }
+    res.json({ message: 'Delivery charge entry deleted successfully.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =========================
+// CART ROUTES
+// =========================
+
+async function buildCartResponse(cart) {
+  const items = [];
+  let subtotal = 0;
+
+  for (const entry of cart.items) {
+    const product = await Product.findById(entry.product);
+    if (!product) {
+      continue;
+    }
+    const lineSubtotal = product.price * entry.quantity;
+    subtotal += lineSubtotal;
+    items.push({
+      product: product._id,
+      name: product.name,
+      image: product.image,
+      price: product.price,
+      stock: product.stock,
+      quantity: entry.quantity,
+      subtotal: lineSubtotal,
+    });
+  }
+
+  return {
+    items,
+    subtotal,
+    itemCount: items.reduce((sum, i) => sum + i.quantity, 0),
+  };
+}
+
+// GET current cart (creates an empty one if none exists yet for this guest)
+app.get('/api/cart', ensureGuestSession, async (req, res) => {
+  try {
+    let cart = await Cart.findOne({ guestId: req.guestId });
+    if (!cart) {
+      cart = await Cart.create({ guestId: req.guestId, items: [] });
+    }
+    res.json(await buildCartResponse(cart));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ADD an item to the cart (or increase quantity if it's already in there)
+app.post('/api/cart/items', ensureGuestSession, async (req, res) => {
+  try {
+    const { productId, quantity } = req.body;
+    const qty = Number(quantity) || 1;
+
+    if (!productId || qty < 1) {
+      return res.status(400).json({ error: 'productId and a quantity of at least 1 are required.' });
+    }
+
+    const product = await Product.findById(productId);
+    if (!product) {
+      return res.status(404).json({ error: 'Product not found.' });
+    }
+
+    let cart = await Cart.findOne({ guestId: req.guestId });
+    if (!cart) {
+      cart = await Cart.create({ guestId: req.guestId, items: [] });
+    }
+
+    const existing = cart.items.find(i => String(i.product) === String(productId));
+    const newQty = (existing ? existing.quantity : 0) + qty;
+
+    try {
+      assertPurchasable(product, newQty);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+
+    if (existing) {
+      existing.quantity = newQty;
+    } else {
+      cart.items.push({ product: productId, quantity: qty });
+    }
+
+    await cart.save();
+    res.json(await buildCartResponse(cart));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// UPDATE an item's quantity in the cart (set to 0 to remove it)
+app.put('/api/cart/items/:productId', ensureGuestSession, async (req, res) => {
+  try {
+    const { quantity } = req.body;
+    const qty = Number(quantity);
+
+    if (Number.isNaN(qty) || qty < 0) {
+      return res.status(400).json({ error: 'quantity must be a number of 0 or more.' });
+    }
+
+    const cart = await Cart.findOne({ guestId: req.guestId });
+    if (!cart) {
+      return res.status(404).json({ error: 'Cart not found.' });
+    }
+
+    if (qty === 0) {
+      cart.items = cart.items.filter(i => String(i.product) !== req.params.productId);
+    } else {
+      const product = await Product.findById(req.params.productId);
+      if (!product) {
+        return res.status(404).json({ error: 'Product not found.' });
+      }
+      try {
+        assertPurchasable(product, qty);
+      } catch (err) {
+        return res.status(400).json({ error: err.message });
+      }
+      const existing = cart.items.find(i => String(i.product) === req.params.productId);
+      if (existing) {
+        existing.quantity = qty;
+      } else {
+        cart.items.push({ product: req.params.productId, quantity: qty });
+      }
+    }
+
+    await cart.save();
+    res.json(await buildCartResponse(cart));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// REMOVE a single item from the cart
+app.delete('/api/cart/items/:productId', ensureGuestSession, async (req, res) => {
+  try {
+    const cart = await Cart.findOne({ guestId: req.guestId });
+    if (!cart) {
+      return res.status(404).json({ error: 'Cart not found.' });
+    }
+    cart.items = cart.items.filter(i => String(i.product) !== req.params.productId);
+    await cart.save();
+    res.json(await buildCartResponse(cart));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// CLEAR the entire cart (used after a successful checkout)
+app.delete('/api/cart', ensureGuestSession, async (req, res) => {
+  try {
+    await Cart.findOneAndUpdate(
+      { guestId: req.guestId },
+      { items: [] },
+      { upsert: true }
+    );
+    res.json({ items: [], subtotal: 0, itemCount: 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// =========================
+// ORDER ROUTES
+// =========================
+
+// CREATE an order from the current cart (public — guest checkout, COD)
+app.post('/api/orders/checkout', ensureGuestSession, optionalAuth, async (req, res) => {
+  const session = await mongoose.startSession();
+  try {
+    const { shipping, paymentMethod, notes } = req.body;
+
+    if (!shipping || !shipping.fullName || !shipping.phone || !shipping.addressLine1 ||
+        !shipping.city || !shipping.state || !shipping.pincode) {
+      return res.status(400).json({ error: 'Missing required shipping details.' });
+    }
+
+    if (paymentMethod === 'razorpay') {
+      return res.status(400).json({
+        error: 'Online payments must use /api/orders/razorpay/create.',
+      });
+    }
+
+    const cart = await Cart.findOne({ guestId: req.guestId });
+    if (!cart || cart.items.length === 0) {
+      return res.status(400).json({ error: 'Your cart is empty.' });
+    }
+
+    const delivery = await resolveDeliveryCharge(shipping.pincode);
+    let orderItems = [];
+    let subtotal = 0;
+
+    await session.withTransaction(async () => {
+      const built = await buildOrderItemsFromCart(cart, session);
+      orderItems = built.orderItems;
+      subtotal = built.subtotal;
+      await decrementStockForOrderItems(orderItems, session);
+    });
+
+    const shippingFee = delivery.deliveryCharge;
+    const discount = 0;
+    const tax = 0;
+    const grandTotal = calculateGrandTotal(subtotal, shippingFee, discount, tax);
+
+    const customerKey = shipping.email
+      ? shipping.email.trim().toLowerCase()
+      : shipping.phone.trim();
+
+    const sequence = await getNextSequence('orderNumber');
+    const orderNumber = `MT${sequence}`;
+
+    const order = await Order.create({
+      orderNumber,
+      user: req.user ? req.user.id : null,
+      guestId: req.guestId,
+      customerKey,
+      items: orderItems,
+      shipping,
+      subtotal,
+      shippingFee,
+      discount,
+      tax,
+      grandTotal,
+      paymentMethod: 'cod',
+      paymentStatus: 'pending',
+      orderStatus: 'order_placed',
+      notes: notes || '',
+    });
+
+    cart.items = [];
+    await cart.save();
+
+    res.status(201).json(order);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  } finally {
+    session.endSession();
+  }
+});
+
+// CREATE a Razorpay order from the current cart (server-calculated total)
+app.post('/api/orders/razorpay/create', ensureGuestSession, optionalAuth, async (req, res) => {
+  try {
+    if (!getRazorpayAuthHeader()) {
+      return res.status(503).json({ error: 'Razorpay is not configured on the server.' });
+    }
+
+    const { shipping, notes } = req.body;
+
+    if (!shipping || !shipping.fullName || !shipping.phone || !shipping.addressLine1 ||
+        !shipping.city || !shipping.state || !shipping.pincode) {
+      return res.status(400).json({ error: 'Missing required shipping details.' });
+    }
+
+    const cart = await Cart.findOne({ guestId: req.guestId });
+    if (!cart || cart.items.length === 0) {
+      return res.status(400).json({ error: 'Your cart is empty.' });
+    }
+
+    const delivery = await resolveDeliveryCharge(shipping.pincode);
+    const { orderItems, subtotal } = await buildOrderItemsFromCart(cart, null);
+
+    const shippingFee = delivery.deliveryCharge;
+    const discount = 0;
+    const tax = 0;
+    const grandTotal = calculateGrandTotal(subtotal, shippingFee, discount, tax);
+
+    const customerKey = shipping.email
+      ? shipping.email.trim().toLowerCase()
+      : shipping.phone.trim();
+
+    const sequence = await getNextSequence('orderNumber');
+    const orderNumber = `MT${sequence}`;
+
+    const order = await Order.create({
+      orderNumber,
+      user: req.user ? req.user.id : null,
+      guestId: req.guestId,
+      customerKey,
+      items: orderItems,
+      shipping,
+      subtotal,
+      shippingFee,
+      discount,
+      tax,
+      grandTotal,
+      paymentMethod: 'razorpay',
+      paymentStatus: 'pending',
+      orderStatus: 'awaiting_payment',
+      notes: notes || '',
+    });
+
+    const razorpayOrder = await createRazorpayOrder({
+      amount: Math.round(grandTotal * 100),
+      currency: 'INR',
+      receipt: orderNumber,
+      notes: {
+        orderId: String(order._id),
+        orderNumber,
+      },
+    });
+
+    order.razorpayOrderId = razorpayOrder.id;
+    await order.save();
+
+    res.status(201).json({
+      orderId: order._id,
+      orderNumber: order.orderNumber,
+      razorpayOrderId: razorpayOrder.id,
+      amount: grandTotal,
+      amountPaise: razorpayOrder.amount,
+      currency: razorpayOrder.currency,
+      keyId: process.env.RAZORPAY_KEY_ID,
+      subtotal,
+      shippingFee,
+      grandTotal,
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// Poll payment status after Razorpay checkout (webhook is source of truth)
+app.get('/api/orders/:id/payment-status', async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id).select(
+      'orderNumber paymentStatus orderStatus grandTotal subtotal shippingFee items shipping razorpayPaymentId paymentMethod'
+    );
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found.' });
+    }
+
+    res.json({
+      orderId: order._id,
+      orderNumber: order.orderNumber,
+      paymentStatus: order.paymentStatus,
+      orderStatus: order.orderStatus,
+      grandTotal: order.grandTotal,
+      subtotal: order.subtotal,
+      shippingFee: order.shippingFee,
+      items: order.items,
+      shipping: order.shipping,
+      paymentMethod: order.paymentMethod,
+      paid: order.paymentStatus === 'paid',
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Razorpay webhook — verifies signature and marks order as paid.
+// Mounted at both /api/razorpay/webhook (existing) and /api/webhook (alias),
+// so whichever URL is configured in the Razorpay Dashboard works.
+//
+// Signature verification hashes the RAW request bytes, not
+// JSON.stringify(req.body). Re-serializing the parsed body is unreliable —
+// key ordering/whitespace can differ from what Razorpay originally signed,
+// which makes genuinely valid webhooks fail verification. `express.raw()`
+// above preserves the exact bytes for these two paths for that reason.
+async function razorpayWebhookHandler(req, res) {
+  try {
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    if (!webhookSecret) {
+      return res.status(503).json({ error: 'Webhook secret is not configured.' });
+    }
+
+    const signature = req.headers['x-razorpay-signature'];
+    const rawBody = req.body; // Buffer — see express.raw() above
+
+    const expectedSignature = crypto
+      .createHmac('sha256', webhookSecret)
+      .update(rawBody)
+      .digest('hex');
+
+    const signatureValid =
+      typeof signature === 'string' &&
+      signature.length === expectedSignature.length &&
+      crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expectedSignature));
+
+    if (!signatureValid) {
+      return res.status(400).json({ error: 'Invalid webhook signature.' });
+    }
+
+    const event = JSON.parse(rawBody.toString('utf8'));
+    const eventType = event.event;
+
+    if (eventType === 'order.paid' || eventType === 'payment.captured') {
+      const payment = event.payload && event.payload.payment && event.payload.payment.entity;
+      const razorpayOrderId = payment && payment.order_id;
+
+      if (!razorpayOrderId) {
+        // Malformed payload — acknowledge so Razorpay doesn't retry forever.
+        return res.status(200).json({ status: 'ok' });
+      }
+
+      const order = await Order.findOne({ razorpayOrderId });
+      if (!order) {
+        return res.status(200).json({ status: 'ok' });
+      }
+
+      if (order.paymentStatus !== 'paid') {
+        const session = await mongoose.startSession();
+        try {
+          await session.withTransaction(async () => {
+            await decrementStockForOrderItems(order.items, session);
+
+            order.paymentStatus = 'paid';
+            order.orderStatus = 'order_placed';
+            order.razorpayPaymentId = payment.id;
+            order.razorpaySignature = signature;
+            await order.save({ session });
+
+            if (order.guestId) {
+              await Cart.findOneAndUpdate(
+                { guestId: order.guestId },
+                { items: [] },
+                { session }
+              );
+            }
+          });
+        } finally {
+          session.endSession();
+        }
+      }
+
+      return res.status(200).json({ status: 'ok' });
+    }
+
+    if (eventType === 'payment.failed') {
+      const payment = event.payload && event.payload.payment && event.payload.payment.entity;
+      const order = payment && await Order.findOne({ razorpayOrderId: payment.order_id });
+      if (order && order.paymentStatus !== 'paid') {
+        order.paymentStatus = 'failed';
+        order.orderStatus = 'cancelled';
+        await order.save();
+      }
+      return res.status(200).json({ status: 'ok' });
+    }
+
+    return res.status(200).json({ status: 'ok' });
+  } catch (err) {
+    console.error('Razorpay webhook error:', err);
+    res.status(500).json({ error: err.message });
+  }
+}
+
+app.post('/api/razorpay/webhook', razorpayWebhookHandler);
+app.post('/api/webhook', razorpayWebhookHandler);
+
+// LIST all orders (admin only)
+app.get('/api/orders', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const orders = await Order.find().sort({ createdAt: -1 });
+    res.json(orders);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET single order by ID (admin only)
+app.get('/api/orders/:id', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id);
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    res.json(order);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// UPDATE order status (admin only) — e.g. mark as shipped/delivered/cancelled
+app.put('/api/orders/:id/status', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const { orderStatus, paymentStatus } = req.body;
+    const update = {};
+
+    if (orderStatus) {
+      const validStatuses = ['awaiting_payment', 'order_placed', 'processing', 'shipped', 'delivered', 'cancelled'];
+      if (!validStatuses.includes(orderStatus)) {
+        return res.status(400).json({ error: `orderStatus must be one of: ${validStatuses.join(', ')}` });
+      }
+      update.orderStatus = orderStatus;
+    }
+    if (paymentStatus) {
+      const validPayments = ['pending', 'paid', 'failed', 'refunded'];
+      if (!validPayments.includes(paymentStatus)) {
+        return res.status(400).json({ error: `paymentStatus must be one of: ${validPayments.join(', ')}` });
+      }
+      update.paymentStatus = paymentStatus;
+    }
+
+    const order = await Order.findByIdAndUpdate(req.params.id, update, {
+      new: true,
+      runValidators: true,
+    });
+
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    res.json(order);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// =========================
+// DASHBOARD / ANALYTICS ROUTES (admin only)
+// =========================
+
+app.get('/api/admin/dashboard-stats', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const orders = await Order.find();
+    const productCount = await Product.countDocuments();
+
+    const totalRevenue = orders.reduce((sum, o) => sum + o.grandTotal, 0);
+    const totalOrders = orders.length;
+
+    const monthly = [];
+    const now = new Date();
+    for (let i = 5; i >= 0; i--) {
+      const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+      const monthLabel = d.toLocaleDateString('en-IN', { month: 'short' });
+      const monthOrders = orders.filter(o => {
+        const od = new Date(o.createdAt);
+        return od.getFullYear() === d.getFullYear() && od.getMonth() === d.getMonth();
+      });
+      monthly.push({
+        m: monthLabel,
+        v: monthOrders.reduce((sum, o) => sum + o.grandTotal, 0),
+        orders: monthOrders.length,
+      });
+    }
+
+    const categoryRevenue = {};
+    const productSales = {};
+
+    for (const order of orders) {
+      for (const item of order.items) {
+        const prod = await Product.findById(item.product).lean();
+        const category = prod ? prod.category : 'Uncategorised';
+
+        categoryRevenue[category] = (categoryRevenue[category] || 0) + item.subtotal;
+
+        const key = String(item.product);
+        if (!productSales[key]) {
+          productSales[key] = { n: item.name, cat: category, sold: 0, rev: 0 };
+        }
+        productSales[key].sold += item.quantity;
+        productSales[key].rev += item.subtotal;
+      }
+    }
+
+    const totalCategoryRevenue = Object.values(categoryRevenue).reduce((a, b) => a + b, 0);
+    const palette = ['#4c1d80', '#9333ea', '#c8a96e', '#3b82f6', '#e24b4a', '#8b5cf6', '#f59e0b'];
+    const categories = Object.entries(categoryRevenue)
+      .sort((a, b) => b[1] - a[1])
+      .map(([c, rev], idx) => ({
+        c,
+        pct: totalCategoryRevenue > 0 ? Math.round((rev / totalCategoryRevenue) * 100) : 0,
+        color: palette[idx % palette.length],
+      }));
+
+    const topProducts = Object.values(productSales)
+      .sort((a, b) => b.sold - a.sold)
+      .slice(0, 5);
+
+    res.json({
+      productCount,
+      totalOrders,
+      totalRevenue,
+      monthly,
+      categories,
+      topProducts,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Customers derived from orders (no customer login exists), grouped by
+// customerKey (email if available, otherwise phone — see orderModel.js).
+app.get('/api/admin/customers', authenticateToken, adminOnly, async (req, res) => {
+  try {
+    const orders = await Order.find().sort({ createdAt: -1 });
+
+    const customerMap = {};
+
+    for (const order of orders) {
+      const key = order.customerKey;
+      if (!customerMap[key]) {
+        customerMap[key] = {
+          name: order.shipping.fullName,
+          phone: order.shipping.phone,
+          email: order.shipping.email || '',
+          city: order.shipping.city,
+          orders: 0,
+          spent: 0,
+          last: order.createdAt,
+        };
+      }
+      customerMap[key].orders += 1;
+      customerMap[key].spent += order.grandTotal;
+      if (new Date(order.createdAt) > new Date(customerMap[key].last)) {
+        customerMap[key].last = order.createdAt;
+      }
+    }
+
+    const customers = Object.values(customerMap).sort((a, b) => b.spent - a.spent);
+    res.json(customers);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+console.log('ROUTES DEFINED - ABOUT TO START SERVER FUNCTION');
+
+async function startServer() {
+  console.log('INSIDE STARTSERVER - BEFORE MONGOOSE CONNECT');
+
+  console.log(
+    'MONGO_URI value is:',
+    process.env.MONGO_URI
+      ? 'DEFINED (hidden for safety)'
+      : 'UNDEFINED'
+  );
+
+  try {
+    console.log('Attempting MongoDB connection...');
+
+    await mongoose.connect(process.env.MONGO_URI, {
+      serverSelectionTimeoutMS: 8000,
+    });
+
+    console.log('MongoDB connection completed');
+    console.log('MongoDB Atlas connected successfully for Zentra Trends!');
+
+    app.listen(PORT, () => {
+      console.log(`Server is running on port ${PORT}`);
+    });
+  } catch (err) {
+    console.error('Startup error:', err);
+    process.exit(1);
+  }
+}
+
+console.log('ABOUT TO CALL STARTSERVER');
+startServer();
+console.log('STARTSERVER CALLED - SCRIPT REACHED END');
