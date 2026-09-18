@@ -8,6 +8,8 @@ const mongoose = require('mongoose');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const multer = require('multer');
+const { v2: cloudinary } = require('cloudinary');
 
 const Product = require('./productModel');
 const User = require('./userModel');
@@ -20,6 +22,30 @@ const { getNextSequence } = require('./counterModel');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// ── Cloudinary config (image storage) ──
+// Product images are uploaded straight to Cloudinary and only the returned
+// URL is stored in MongoDB, so product documents/API payloads stay small —
+// this is what removes the old ~100kb request-size ceiling on image uploads.
+cloudinary.config({
+  cloud_name: process.env.Cloud_name,
+  api_key: process.env.cloud_api,
+  api_secret: process.env.cloud_secret,
+});
+
+// Multer holds the uploaded file in memory (no disk writes needed) so it can
+// be streamed straight to Cloudinary. 5MB is comfortably above any real
+// product photo while still guarding against abuse.
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (!file.mimetype.startsWith('image/')) {
+      return cb(new Error('Only image files are allowed'));
+    }
+    cb(null, true);
+  },
+});
 
 // ── CORS configuration ──
 const DEV_ORIGINS = [
@@ -537,6 +563,47 @@ app.get('/api/products/:id', async (req, res) => {
     });
   }
 });
+
+// Upload a single image file to Cloudinary and return its URL. The Admin
+// portal calls this first, then sends the returned `url` (a short string)
+// as the product's `image` field — the actual image bytes never pass
+// through the /api/products JSON routes at all.
+app.post(
+  '/api/upload',
+  authenticateToken,
+  adminOnly,
+  (req, res) => {
+    upload.single('image')(req, res, async (err) => {
+      if (err) {
+        const message = err.code === 'LIMIT_FILE_SIZE'
+          ? 'Image is too large (max 5MB).'
+          : (err.message || 'Upload failed.');
+        return res.status(400).json({ error: message });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({ error: 'No image file was provided.' });
+      }
+
+      try {
+        const dataUri = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
+        const result = await cloudinary.uploader.upload(dataUri, {
+          folder: 'zentra-trends/products',
+        });
+
+        res.status(201).json({
+          url: result.secure_url,
+          publicId: result.public_id,
+        });
+      } catch (uploadErr) {
+        res.status(500).json({
+          error: 'Image upload failed. Please try again.',
+          details: uploadErr.message,
+        });
+      }
+    });
+  }
+);
 
 // CREATE a new product
 app.post(
