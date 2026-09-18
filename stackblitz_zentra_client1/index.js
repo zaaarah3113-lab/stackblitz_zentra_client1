@@ -582,6 +582,7 @@ app.put(
       product.image = req.body.image !== undefined ? req.body.image : product.image;
       product.fabric = req.body.fabric !== undefined ? req.body.fabric : product.fabric;
       product.care = req.body.care !== undefined ? req.body.care : product.care;
+      product.isNewArrival = req.body.isNewArrival !== undefined ? req.body.isNewArrival : product.isNewArrival;
 
       await product.save();
 

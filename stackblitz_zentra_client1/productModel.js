@@ -43,6 +43,16 @@ const productSchema = new mongoose.Schema({
     enum: ['In Stock', 'Low Stock', 'Out of Stock'],
     default: 'In Stock',
   },
+  // ↓ THE BUG: this field was missing entirely. Mongoose silently drops any
+  // key sent in a request that isn't declared in the schema, so even though
+  // the Admin portal's saveProd() already sends `isNewArrival: true/false`
+  // on every create/update, it was being stripped before .save() ever ran —
+  // the value never reached the database, so the User portal's slider had
+  // nothing to filter on.
+  isNewArrival: {
+    type: Boolean,
+    default: false,
+  },
 }, { timestamps: true });
 
 // The Admin portal only ever sets `stockStatus` (a text dropdown) — it never
